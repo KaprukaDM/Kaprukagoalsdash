@@ -281,6 +281,40 @@ app.get('/api/actuals', async (req, res) => {
 // SYNC — Pull live data from all platforms
 // POST /api/sync
 // ════════════════════════════════════════════════════════════════
+app.post('/api/reset', async (req, res) => {
+  try {
+    const month = parseInt(req.query.month || req.body?.month) || new Date().getMonth() + 1;
+    const year  = parseInt(req.query.year  || req.body?.year)  || new Date().getFullYear();
+
+    const { error: kmErr } = await supabase.from('channel_metrics').delete();
+    if (kmErr) throw kmErr;
+
+    const { error: gpErr } = await supabase.from('goal_kpis').delete();
+    if (gpErr) throw gpErr;
+
+    const { error: gErr } = await supabase.from('goals').delete();
+    if (gErr) throw gErr;
+
+    const { error: aErr } = await supabase.from('kpi_actuals').delete();
+    if (aErr) throw aErr;
+
+    const { error: cErr } = await supabase.from('channels').delete();
+    if (cErr) throw cErr;
+
+    // Optional: Pull this month live data after reset
+    const syncRes = await fetch(`http://localhost:${PORT}/api/sync?month=${month}&year=${year}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    });
+    const syncData = await syncRes.json();
+
+    res.json({ success: true, reset: true, month, year, sync: syncData });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/sync', async (req, res) => {
   const month = parseInt(req.query.month || req.body?.month) || new Date().getMonth() + 1;
   const year  = parseInt(req.query.year  || req.body?.year)  || new Date().getFullYear();
