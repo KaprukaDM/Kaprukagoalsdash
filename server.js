@@ -78,9 +78,42 @@ app.post('/api/channels', async (req, res) => {
 
 app.delete('/api/channels/:id', async (req, res) => {
   try {
-    const { error } = await supabase.from('channels').delete().eq('id', req.params.id);
+    // Delete related metrics, goals, and actuals for that channel too
+    const channelId = req.params.id;
+
+    const { error: mErr } = await supabase.from('channel_metrics').delete().eq('channel_id', channelId);
+    if (mErr) throw mErr;
+
+    const { error: gErr } = await supabase.from('goals').delete().eq('channel_id', channelId);
+    if (gErr) throw gErr;
+
+    const { error: aErr } = await supabase.from('kpi_actuals').delete().eq('channel_id', channelId);
+    if (aErr) throw aErr;
+
+    const { error } = await supabase.from('channels').delete().eq('id', channelId);
     if (error) throw error;
-    res.json({ success: true, deleted: req.params.id });
+    res.json({ success: true, deleted: channelId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/channels', async (req, res) => {
+  try {
+    const { error: mErr2 } = await supabase.from('channel_metrics').delete();
+    if (mErr2) throw mErr2;
+
+    const { error: gErr2 } = await supabase.from('goals').delete();
+    if (gErr2) throw gErr2;
+
+    const { error: aErr2 } = await supabase.from('kpi_actuals').delete();
+    if (aErr2) throw aErr2;
+
+    const { error } = await supabase.from('channels').delete();
+    if (error) throw error;
+
+    res.json({ success: true, deleted_all: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -129,9 +162,45 @@ app.post('/api/goals', async (req, res) => {
 
 app.delete('/api/goals/:id', async (req, res) => {
   try {
+    // Remove KPI child rows to avoid stale goal data being referenced later
+    const { error: kpiErr } = await supabase.from('goal_kpis').delete().eq('goal_id', req.params.id);
+    if (kpiErr) throw kpiErr;
+
     const { error } = await supabase.from('goals').delete().eq('id', req.params.id);
     if (error) throw error;
     res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/goals', async (req, res) => {
+  try {
+    const month = req.query.month;
+    const year = req.query.year;
+
+    let goalsQuery = supabase.from('goals').select('id');
+    if (month) goalsQuery = goalsQuery.eq('month', month);
+    if (year) goalsQuery = goalsQuery.eq('year', year);
+
+    const { data: goalRows, error: selErr } = await goalsQuery;
+    if (selErr) throw selErr;
+
+    const goalIds = (goalRows || []).map((g) => g.id);
+    if (goalIds.length) {
+      const { error: kpiErr2 } = await supabase.from('goal_kpis').delete().in('goal_id', goalIds);
+      if (kpiErr2) throw kpiErr2;
+    }
+
+    let deleteQuery = supabase.from('goals').delete();
+    if (month) deleteQuery = deleteQuery.eq('month', month);
+    if (year) deleteQuery = deleteQuery.eq('year', year);
+
+    const { error: gErr } = await deleteQuery;
+    if (gErr) throw gErr;
+
+    res.json({ success: true, deleted_goals: goalIds.length });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
