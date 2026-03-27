@@ -17,11 +17,20 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// ── Date helpers ─────────────────────────────────────────────────
+function monthStart(year, month) {
+  return `${year}-${String(month).padStart(2, '0')}-01`;
+}
+function monthEnd(year, month) {
+  // Last day of the month — works for all months including Feb
+  return new Date(year, month, 0).toISOString().split('T')[0];
+}
+
 // ════════════════════════════════════════════════════════════════
 // HEALTH CHECK
 // ════════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Kapruka Goal Dashboard API v2' });
+  res.json({ status: 'ok', service: 'Kapruka Goal Dashboard API v2', currency: 'USD' });
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -78,7 +87,6 @@ app.post('/api/channels', async (req, res) => {
 
 app.delete('/api/channels/:id', async (req, res) => {
   try {
-    // Delete related metrics, goals, and actuals for that channel too
     const channelId = req.params.id;
 
     const { error: mErr } = await supabase.from('channel_metrics').delete().eq('channel_id', channelId);
@@ -162,7 +170,6 @@ app.post('/api/goals', async (req, res) => {
 
 app.delete('/api/goals/:id', async (req, res) => {
   try {
-    // Remove KPI child rows to avoid stale goal data being referenced later
     const { error: kpiErr } = await supabase.from('goal_kpis').delete().eq('goal_id', req.params.id);
     if (kpiErr) throw kpiErr;
 
@@ -182,12 +189,12 @@ app.delete('/api/goals', async (req, res) => {
 
     let goalsQuery = supabase.from('goals').select('id');
     if (month) goalsQuery = goalsQuery.eq('month', month);
-    if (year) goalsQuery = goalsQuery.eq('year', year);
+    if (year)  goalsQuery = goalsQuery.eq('year', year);
 
     const { data: goalRows, error: selErr } = await goalsQuery;
     if (selErr) throw selErr;
 
-    const goalIds = (goalRows || []).map((g) => g.id);
+    const goalIds = (goalRows || []).map(g => g.id);
     if (goalIds.length) {
       const { error: kpiErr2 } = await supabase.from('goal_kpis').delete().in('goal_id', goalIds);
       if (kpiErr2) throw kpiErr2;
@@ -195,7 +202,7 @@ app.delete('/api/goals', async (req, res) => {
 
     let deleteQuery = supabase.from('goals').delete();
     if (month) deleteQuery = deleteQuery.eq('month', month);
-    if (year) deleteQuery = deleteQuery.eq('year', year);
+    if (year)  deleteQuery = deleteQuery.eq('year', year);
 
     const { error: gErr } = await deleteQuery;
     if (gErr) throw gErr;
@@ -278,8 +285,118 @@ app.get('/api/actuals', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// SYNC — Pull live data from all platforms
-// POST /api/sync
+// BASELINE — average of last 3 months for a channel + kpi key
+// GET /api/goals/baseline?channel_id=&kpi_key=&month=&year=
+// Returns { baseline, months_used, values[] }
+// ════════════════════════════════════════════════════════════════
+app.get('/api/goals/baseline', async (req, res) => {
+  try {
+    const { channel_id, kpi_key } = req.query;
+    const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+    const year  = parseInt(req.query.year)  || new Date().getFullYear();
+
+    if (!channel_id || !kpi_key) {
+      return res.status(400).json({ error: 'channel_id and kpi_key are required' });
+    }
+
+    // Build the last 3 month/year pairs before the current month
+    const periods = [];
+    for (let i = 1; i <= 3; i++) {
+      let m = month - i;
+      let y = year;
+      if (m <= 0) { m += 12; y -= 1; }
+      periods.push({ month: m, year: y });
+    }
+
+    // Fetch all three months in one query using OR filters
+    const orFilter = periods
+      .map(p => `and(month.eq.${p.month},year.eq.${p.year})`)
+      .join(',');
+
+    const { data, error } = await supabase
+      .from('kpi_actuals')
+      .select('value, month, year')
+      .eq('channel_id', channel_id)
+      .eq('kpi_key', kpi_key)
+      .or(orFilter);
+
+    if (error) throw error;
+
+    if (!data || data.length === 0) {
+      return res.json({ baseline: null, months_used: 0, values: [] });
+    }
+
+    const values = data.map(r => ({ month: r.month, year: r.year, value: parseFloat(r.value) }));
+    const sum    = values.reduce((s, v) => s + v.value, 0);
+    const baseline = parseFloat((sum / values.length).toFixed(2));
+
+    res.json({ baseline, months_used: values.length, values });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// BASELINE BULK — fetch baselines for all KPIs of a channel at once
+// GET /api/goals/baseline/bulk?channel_id=&month=&year=
+// Returns { [kpi_key]: { baseline, months_used } }
+// ════════════════════════════════════════════════════════════════
+app.get('/api/goals/baseline/bulk', async (req, res) => {
+  try {
+    const { channel_id } = req.query;
+    const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+    const year  = parseInt(req.query.year)  || new Date().getFullYear();
+
+    if (!channel_id) {
+      return res.status(400).json({ error: 'channel_id is required' });
+    }
+
+    const periods = [];
+    for (let i = 1; i <= 3; i++) {
+      let m = month - i;
+      let y = year;
+      if (m <= 0) { m += 12; y -= 1; }
+      periods.push({ month: m, year: y });
+    }
+
+    const orFilter = periods
+      .map(p => `and(month.eq.${p.month},year.eq.${p.year})`)
+      .join(',');
+
+    const { data, error } = await supabase
+      .from('kpi_actuals')
+      .select('kpi_key, value, month, year')
+      .eq('channel_id', channel_id)
+      .or(orFilter);
+
+    if (error) throw error;
+
+    // Group by kpi_key and average
+    const grouped = {};
+    (data || []).forEach(row => {
+      if (!grouped[row.kpi_key]) grouped[row.kpi_key] = [];
+      grouped[row.kpi_key].push(parseFloat(row.value));
+    });
+
+    const result = {};
+    Object.entries(grouped).forEach(([key, vals]) => {
+      const avg = vals.reduce((s, v) => s + v, 0) / vals.length;
+      result[key] = {
+        baseline: parseFloat(avg.toFixed(2)),
+        months_used: vals.length
+      };
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// RESET
 // ════════════════════════════════════════════════════════════════
 app.post('/api/reset', async (req, res) => {
   try {
@@ -301,7 +418,6 @@ app.post('/api/reset', async (req, res) => {
     const { error: cErr } = await supabase.from('channels').delete();
     if (cErr) throw cErr;
 
-    // Optional: Pull this month live data after reset
     const syncRes = await fetch(`http://localhost:${PORT}/api/sync?month=${month}&year=${year}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
@@ -315,10 +431,17 @@ app.post('/api/reset', async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════
+// SYNC — Pull live data from all platforms (all values in USD)
+// POST /api/sync
+// ════════════════════════════════════════════════════════════════
 app.post('/api/sync', async (req, res) => {
   const month = parseInt(req.query.month || req.body?.month) || new Date().getMonth() + 1;
   const year  = parseInt(req.query.year  || req.body?.year)  || new Date().getFullYear();
-  const results = { synced: [], errors: [] };
+  const results = { synced: [], errors: [], currency: 'USD' };
+
+  const start = monthStart(year, month);
+  const end   = monthEnd(year, month);
 
   async function upsert(channel_id, kpi_key, value) {
     const { error } = await supabase.from('kpi_actuals').upsert(
@@ -329,6 +452,7 @@ app.post('/api/sync', async (req, res) => {
   }
 
   // ── Google Ads ───────────────────────────────────────────────
+  // All monetary values kept in USD (cost_micros / 1,000,000)
   try {
     const { GoogleAdsApi } = await import('google-ads-api');
     const client = new GoogleAdsApi({
@@ -341,73 +465,86 @@ app.post('/api/sync', async (req, res) => {
       login_customer_id: process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID,
       refresh_token:     process.env.GOOGLE_ADS_REFRESH_TOKEN,
     });
-    const start = `${year}-${String(month).padStart(2,'0')}-01`;
-    const end   = new Date(year, month, 0).toISOString().split('T')[0];
-    const rows  = await customer.query(`
+
+    const rows = await customer.query(`
       SELECT metrics.conversions, metrics.cost_micros
       FROM campaign
       WHERE segments.date BETWEEN '${start}' AND '${end}'
         AND campaign.status = 'ENABLED'
     `);
-    let conversions = 0, spend = 0;
+
+    let conversions = 0, spendUSD = 0;
     rows.forEach(r => {
       conversions += r.metrics.conversions || 0;
-      spend       += (r.metrics.cost_micros || 0) / 1_000_000;
+      // cost_micros → USD: divide by 1,000,000
+      spendUSD    += (r.metrics.cost_micros || 0) / 1_000_000;
     });
-    const spendLKR = Math.round(spend * 350);
-    const cpa      = conversions > 0 ? Math.round(spendLKR / conversions) : 0;
+
+    spendUSD = parseFloat(spendUSD.toFixed(2));
+    const cpa = conversions > 0 ? parseFloat((spendUSD / conversions).toFixed(2)) : 0;
+
     await upsert('google_ads', 'conversions', Math.round(conversions));
-    await upsert('google_ads', 'spend',       spendLKR);
+    await upsert('google_ads', 'spend',       spendUSD);
     await upsert('google_ads', 'cpa',         cpa);
-    await supabase.from('channels').update({ spent: spendLKR }).eq('id', 'google_ads');
+    await supabase.from('channels').update({ spent: spendUSD }).eq('id', 'google_ads');
     results.synced.push('google_ads');
   } catch (e) {
     results.errors.push({ channel: 'google_ads', error: e.message });
   }
 
   // ── Meta Ads ─────────────────────────────────────────────────
+  // Meta returns spend in USD by default — no conversion needed
   try {
-    const startDate = `${year}-${String(month).padStart(2,'0')}-01`;
-    const endDate   = new Date(year, month, 0).toISOString().split('T')[0];
     const token     = process.env.META_ACCESS_TOKEN;
     const accountId = process.env.META_AD_ACCOUNT_ID;
     const fields    = 'reach,impressions,spend,actions,action_values,clicks,cpm,frequency,video_p3_watched_actions';
-    const url       = `https://graph.facebook.com/v18.0/${accountId}/insights?fields=${fields}&time_range={"since":"${startDate}","until":"${endDate}"}&level=account&access_token=${token}`;
-    const r         = await fetch(url);
-    const data      = await r.json();
-    const d         = data.data?.[0] || {};
-    const purchases = parseInt((d.actions||[]).find(a=>a.action_type==='purchase')?.value || 0);
-    const revenue   = parseFloat((d.action_values||[]).find(a=>a.action_type==='purchase')?.value || 0);
-    const spendLKR  = Math.round(parseFloat(d.spend||0) * 350);
-    const reach     = parseInt(d.reach||0);
-    const impressions = parseInt(d.impressions||0);
-    const clicks    = parseInt(d.clicks||0);
-    const cpm       = Math.round(parseFloat(d.cpm||0) * 350);
-    const frequency = parseFloat(parseFloat(d.frequency||0).toFixed(2));
-    const videoViews= parseInt((d.video_p3_watched_actions||[{}])[0]?.value||0);
-    const ctr       = impressions > 0 ? parseFloat((clicks/impressions*100).toFixed(2)) : 0;
-    const brandSpend= Math.round(spendLKR * 0.4);
-    const revSpend  = Math.round(spendLKR * 0.6);
-    const cpa       = purchases > 0 ? Math.round(revSpend / purchases) : 0;
-    const roas      = revSpend > 0 ? parseFloat((revenue*350/revSpend).toFixed(2)) : 0;
+    const url       = `https://graph.facebook.com/v18.0/${accountId}/insights?fields=${fields}&time_range={"since":"${start}","until":"${end}"}&level=account&access_token=${token}`;
+
+    const r    = await fetch(url);
+    const data = await r.json();
+
+    if (data.error) throw new Error(data.error.message);
+
+    const d = data.data?.[0] || {};
+
+    const purchases   = parseInt((d.actions||[]).find(a => a.action_type === 'purchase')?.value || 0);
+    const revenueUSD  = parseFloat((d.action_values||[]).find(a => a.action_type === 'purchase')?.value || 0);
+    // spend is already in USD from Meta API
+    const totalSpendUSD  = parseFloat(parseFloat(d.spend || 0).toFixed(2));
+    const reach          = parseInt(d.reach || 0);
+    const impressions    = parseInt(d.impressions || 0);
+    const clicks         = parseInt(d.clicks || 0);
+    // cpm is already in USD from Meta API
+    const cpm            = parseFloat(parseFloat(d.cpm || 0).toFixed(2));
+    const frequency      = parseFloat(parseFloat(d.frequency || 0).toFixed(2));
+    const videoViews     = parseInt((d.video_p3_watched_actions || [{}])[0]?.value || 0);
+    const ctr            = impressions > 0 ? parseFloat((clicks / impressions * 100).toFixed(2)) : 0;
+
+    // Split 40% branding / 60% revenue (approximation — adjust if you have separate ad accounts)
+    const brandSpendUSD = parseFloat((totalSpendUSD * 0.4).toFixed(2));
+    const revSpendUSD   = parseFloat((totalSpendUSD * 0.6).toFixed(2));
+    const cpa           = purchases > 0 ? parseFloat((revSpendUSD / purchases).toFixed(2)) : 0;
+    const roas          = revSpendUSD > 0 ? parseFloat((revenueUSD / revSpendUSD).toFixed(2)) : 0;
 
     await upsert('fb_branding', 'reach',        reach);
     await upsert('fb_branding', 'impressions',  impressions);
-    await upsert('fb_branding', 'spend',        brandSpend);
+    await upsert('fb_branding', 'spend',        brandSpendUSD);
     await upsert('fb_branding', 'cpm',          cpm);
     await upsert('fb_branding', 'frequency',    frequency);
     await upsert('fb_branding', 'video_views',  videoViews);
     await upsert('fb_branding', 'link_clicks',  Math.round(clicks * 0.4));
     await upsert('fb_branding', 'ctr',          ctr);
+
     await upsert('fb_revenue',  'conversions',  purchases);
     await upsert('fb_revenue',  'reach',        Math.round(reach * 0.6));
     await upsert('fb_revenue',  'impressions',  Math.round(impressions * 0.6));
-    await upsert('fb_revenue',  'spend',        revSpend);
+    await upsert('fb_revenue',  'spend',        revSpendUSD);
     await upsert('fb_revenue',  'cpa',          cpa);
     await upsert('fb_revenue',  'roas',         roas);
     await upsert('fb_revenue',  'link_clicks',  Math.round(clicks * 0.6));
-    await supabase.from('channels').update({ spent: brandSpend }).eq('id', 'fb_branding');
-    await supabase.from('channels').update({ spent: revSpend   }).eq('id', 'fb_revenue');
+
+    await supabase.from('channels').update({ spent: brandSpendUSD }).eq('id', 'fb_branding');
+    await supabase.from('channels').update({ spent: revSpendUSD   }).eq('id', 'fb_revenue');
     results.synced.push('fb_branding', 'fb_revenue');
   } catch (e) {
     results.errors.push({ channel: 'fb_meta', error: e.message });
@@ -419,15 +556,23 @@ app.post('/api/sync', async (req, res) => {
     const pageId = process.env.META_PAGE_ID;
     const metricsStr = 'page_impressions,page_reach,page_post_engagements,page_fan_adds_unique';
     const url    = `https://graph.facebook.com/v18.0/${pageId}/insights?metric=${metricsStr}&period=month&access_token=${token}`;
-    const r      = await fetch(url);
-    const data   = await r.json();
+
+    const r    = await fetch(url);
+    const data = await r.json();
+
+    if (data.error) throw new Error(data.error.message);
+
     const byName = {};
-    (data.data||[]).forEach(m => { byName[m.name] = m.values?.[m.values.length-1]?.value || 0; });
-    const impressions     = parseInt(byName['page_impressions']||0);
-    const reach           = parseInt(byName['page_reach']||0);
-    const engagements     = parseInt(byName['page_post_engagements']||0);
-    const followersGained = parseInt(byName['page_fan_adds_unique']||0);
-    const engagementRate  = reach > 0 ? parseFloat((engagements/reach*100).toFixed(2)) : 0;
+    (data.data || []).forEach(m => {
+      byName[m.name] = m.values?.[m.values.length - 1]?.value || 0;
+    });
+
+    const impressions     = parseInt(byName['page_impressions'] || 0);
+    const reach           = parseInt(byName['page_reach'] || 0);
+    const engagements     = parseInt(byName['page_post_engagements'] || 0);
+    const followersGained = parseInt(byName['page_fan_adds_unique'] || 0);
+    const engagementRate  = reach > 0 ? parseFloat((engagements / reach * 100).toFixed(2)) : 0;
+
     await upsert('fb_organic', 'reach',            reach);
     await upsert('fb_organic', 'post_impressions', impressions);
     await upsert('fb_organic', 'engagement_rate',  engagementRate);
@@ -440,6 +585,7 @@ app.post('/api/sync', async (req, res) => {
   }
 
   // ── Google Search Console ────────────────────────────────────
+  // GSC metrics are counts (clicks, impressions) — no currency involved
   try {
     const { google } = await import('googleapis');
     const auth = new google.auth.OAuth2(
@@ -447,24 +593,36 @@ app.post('/api/sync', async (req, res) => {
       process.env.GOOGLE_CLIENT_SECRET
     );
     auth.setCredentials({ refresh_token: process.env.GSC_REFRESH_TOKEN });
-    const sc        = google.searchconsole({ version: 'v1', auth });
-    const startDate = `${year}-${String(month).padStart(2,'0')}-01`;
-    const endDate   = new Date(year, month, 0).toISOString().split('T')[0];
+    const sc = google.searchconsole({ version: 'v1', auth });
+
     const r = await sc.searchanalytics.query({
       siteUrl: process.env.GSC_SITE_URL,
-      requestBody: { startDate, endDate, dimensions: [], rowLimit: 1 }
+      requestBody: {
+        startDate: start,
+        endDate:   end,
+        dimensions: [],
+        rowLimit: 1
+      }
     });
+
     const row = r.data?.rows?.[0] || {};
     await upsert('seo', 'clicks',       Math.round(row.clicks      || 0));
     await upsert('seo', 'impressions',  Math.round(row.impressions || 0));
-    await upsert('seo', 'ctr',          parseFloat(((row.ctr||0)*100).toFixed(2)));
-    await upsert('seo', 'avg_position', parseFloat((row.position||0).toFixed(1)));
+    await upsert('seo', 'ctr',          parseFloat(((row.ctr || 0) * 100).toFixed(2)));
+    await upsert('seo', 'avg_position', parseFloat((row.position   || 0).toFixed(1)));
     results.synced.push('seo');
   } catch (e) {
     results.errors.push({ channel: 'seo', error: e.message });
   }
 
-  res.json({ success: true, month, year, synced_at: new Date().toISOString(), ...results });
+  res.json({
+    success: true,
+    currency: 'USD',
+    month, year,
+    synced_at: new Date().toISOString(),
+    date_range: { start, end },
+    ...results
+  });
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -480,25 +638,30 @@ app.post('/api/goals/suggest', async (req, res) => {
     if (process.env.GEMINI_API_KEY) {
       const prompt = `You are a digital marketing analyst for Kapruka, Sri Lanka's leading e-commerce platform.
 A team member wants to set a "${goalType}" goal: "${goalName}" for the "${activity}" channel.
-Available metrics: ${(metrics||[]).map(m=>m.label).join(', ')}.
+All monetary values are in USD.
+Available metrics: ${(metrics || []).map(m => m.label).join(', ')}.
 Suggest the 3 most relevant KPIs to track this goal.
 Respond ONLY with valid JSON, no markdown:
-{"reasoning":"one sentence why","suggested_kpis":[{"key":"metric_key","label":"Metric Label","unit":"LKR or % or x or empty","suggested_target":0,"why":"one sentence"}]}`;
-      const r    = await fetch(
+{"reasoning":"one sentence why","suggested_kpis":[{"key":"metric_key","label":"Metric Label","unit":"USD or % or x or empty","suggested_target":0,"why":"one sentence"}]}`;
+
+      const r = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        { method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }] }) }
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        }
       );
       const d     = await r.json();
       const text  = d.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      const clean = text.replace(/```json|```/g,'').trim();
+      const clean = text.replace(/```json|```/g, '').trim();
       return res.json(JSON.parse(clean));
     }
 
     res.json({
-      reasoning: `Top metrics for "${goalName}" on ${activity}`,
-      suggested_kpis: (metrics||[]).slice(0,3).map(m => ({
-        key: m.key, label: m.label, unit: m.unit||'',
+      reasoning: `Top metrics for "${goalName}" on ${activity} (all values in USD)`,
+      suggested_kpis: (metrics || []).slice(0, 3).map(m => ({
+        key: m.key, label: m.label, unit: m.unit || '',
         suggested_target: 0, why: `Key performance indicator for ${activity}`
       }))
     });
@@ -511,5 +674,6 @@ Respond ONLY with valid JSON, no markdown:
 // ── Start ────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`✅ Kapruka Goals API running on port ${PORT}`);
+  console.log(`   Currency: USD (no conversion applied)`);
   console.log(`   Supabase: ${process.env.SUPABASE_URL ? '✓ connected' : '✗ missing SUPABASE_URL'}`);
 });
