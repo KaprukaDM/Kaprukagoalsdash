@@ -8,7 +8,17 @@ import { createClient } from '@supabase/supabase-js';
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+// ── CORS Fix — explicitly allow your GitHub Pages domain ────────
+app.use(cors({
+  origin: [
+    'https://kaprukadm.github.io',
+    'http://localhost:3000',
+    'http://localhost:5500'
+  ],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
 // ── Supabase client ─────────────────────────────────────────────
@@ -22,7 +32,6 @@ function monthStart(year, month) {
   return `${year}-${String(month).padStart(2, '0')}-01`;
 }
 function monthEnd(year, month) {
-  // Last day of the month — works for all months including Feb
   return new Date(year, month, 0).toISOString().split('T')[0];
 }
 
@@ -285,9 +294,7 @@ app.get('/api/actuals', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// BASELINE — average of last 3 months for a channel + kpi key
-// GET /api/goals/baseline?channel_id=&kpi_key=&month=&year=
-// Returns { baseline, months_used, values[] }
+// BASELINE
 // ════════════════════════════════════════════════════════════════
 app.get('/api/goals/baseline', async (req, res) => {
   try {
@@ -299,7 +306,6 @@ app.get('/api/goals/baseline', async (req, res) => {
       return res.status(400).json({ error: 'channel_id and kpi_key are required' });
     }
 
-    // Build the last 3 month/year pairs before the current month
     const periods = [];
     for (let i = 1; i <= 3; i++) {
       let m = month - i;
@@ -308,7 +314,6 @@ app.get('/api/goals/baseline', async (req, res) => {
       periods.push({ month: m, year: y });
     }
 
-    // Fetch all three months in one query using OR filters
     const orFilter = periods
       .map(p => `and(month.eq.${p.month},year.eq.${p.year})`)
       .join(',');
@@ -338,9 +343,7 @@ app.get('/api/goals/baseline', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// BASELINE BULK — fetch baselines for all KPIs of a channel at once
-// GET /api/goals/baseline/bulk?channel_id=&month=&year=
-// Returns { [kpi_key]: { baseline, months_used } }
+// BASELINE BULK
 // ════════════════════════════════════════════════════════════════
 app.get('/api/goals/baseline/bulk', async (req, res) => {
   try {
@@ -372,7 +375,6 @@ app.get('/api/goals/baseline/bulk', async (req, res) => {
 
     if (error) throw error;
 
-    // Group by kpi_key and average
     const grouped = {};
     (data || []).forEach(row => {
       if (!grouped[row.kpi_key]) grouped[row.kpi_key] = [];
@@ -432,8 +434,7 @@ app.post('/api/reset', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// SYNC — Pull live data from all platforms (all values in USD)
-// POST /api/sync
+// SYNC
 // ════════════════════════════════════════════════════════════════
 app.post('/api/sync', async (req, res) => {
   const month = parseInt(req.query.month || req.body?.month) || new Date().getMonth() + 1;
@@ -452,7 +453,6 @@ app.post('/api/sync', async (req, res) => {
   }
 
   // ── Google Ads ───────────────────────────────────────────────
-  // All monetary values kept in USD (cost_micros / 1,000,000)
   try {
     const { GoogleAdsApi } = await import('google-ads-api');
     const client = new GoogleAdsApi({
@@ -476,7 +476,6 @@ app.post('/api/sync', async (req, res) => {
     let conversions = 0, spendUSD = 0;
     rows.forEach(r => {
       conversions += r.metrics.conversions || 0;
-      // cost_micros → USD: divide by 1,000,000
       spendUSD    += (r.metrics.cost_micros || 0) / 1_000_000;
     });
 
@@ -493,7 +492,6 @@ app.post('/api/sync', async (req, res) => {
   }
 
   // ── Meta Ads ─────────────────────────────────────────────────
-  // Meta returns spend in USD by default — no conversion needed
   try {
     const token     = process.env.META_ACCESS_TOKEN;
     const accountId = process.env.META_AD_ACCOUNT_ID;
@@ -507,20 +505,17 @@ app.post('/api/sync', async (req, res) => {
 
     const d = data.data?.[0] || {};
 
-    const purchases   = parseInt((d.actions||[]).find(a => a.action_type === 'purchase')?.value || 0);
-    const revenueUSD  = parseFloat((d.action_values||[]).find(a => a.action_type === 'purchase')?.value || 0);
-    // spend is already in USD from Meta API
+    const purchases      = parseInt((d.actions||[]).find(a => a.action_type === 'purchase')?.value || 0);
+    const revenueUSD     = parseFloat((d.action_values||[]).find(a => a.action_type === 'purchase')?.value || 0);
     const totalSpendUSD  = parseFloat(parseFloat(d.spend || 0).toFixed(2));
     const reach          = parseInt(d.reach || 0);
     const impressions    = parseInt(d.impressions || 0);
     const clicks         = parseInt(d.clicks || 0);
-    // cpm is already in USD from Meta API
     const cpm            = parseFloat(parseFloat(d.cpm || 0).toFixed(2));
     const frequency      = parseFloat(parseFloat(d.frequency || 0).toFixed(2));
     const videoViews     = parseInt((d.video_p3_watched_actions || [{}])[0]?.value || 0);
     const ctr            = impressions > 0 ? parseFloat((clicks / impressions * 100).toFixed(2)) : 0;
 
-    // Split 40% branding / 60% revenue (approximation — adjust if you have separate ad accounts)
     const brandSpendUSD = parseFloat((totalSpendUSD * 0.4).toFixed(2));
     const revSpendUSD   = parseFloat((totalSpendUSD * 0.6).toFixed(2));
     const cpa           = purchases > 0 ? parseFloat((revSpendUSD / purchases).toFixed(2)) : 0;
@@ -585,7 +580,6 @@ app.post('/api/sync', async (req, res) => {
   }
 
   // ── Google Search Console ────────────────────────────────────
-  // GSC metrics are counts (clicks, impressions) — no currency involved
   try {
     const { google } = await import('googleapis');
     const auth = new google.auth.OAuth2(
@@ -627,7 +621,6 @@ app.post('/api/sync', async (req, res) => {
 
 // ════════════════════════════════════════════════════════════════
 // AI GOAL SUGGESTIONS
-// POST /api/goals/suggest
 // ════════════════════════════════════════════════════════════════
 app.post('/api/goals/suggest', async (req, res) => {
   try {
